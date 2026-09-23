@@ -186,7 +186,8 @@ These are architect assumptions, not product decisions. Flag to product-manager 
 | Feature-flagged, reset-style `initdb` | (a) fully open endpoint; (b) auth-protected endpoint; (c) upsert-only; (d) CLI script instead of an endpoint | (a) is an unauthenticated data-wipe in any environment where it ships; (b) creates a chicken-and-egg problem (you need a user to create users) and blocks QA; (c) leaves drifted/extra documents behind so the "exactly 10 / exactly 2" metric cannot be guaranteed; (d) the PRD explicitly requires a callable `initdb` endpoint visible in Swagger (US-4, US-5). A CLI script may be added later as a thin wrapper over the same service. |
 | `{ items, total }` list envelope | bare JSON array | An array cannot carry pagination/metadata later without a breaking change; the envelope costs one line on the client. |
 | No state-management library | NgRx / NgRx Component Store / Akita / SignalStore | Two screens and one selected entity; a store would be more code than the feature. An `AuthService` holding a `signal` plus `computed` is sufficient (ADR-005), and Angular 22 signals already cover the little shared state there is. |
-| Manual TS models on the front | (a) shared workspace package; (b) generated client from Swagger JSON | (a) requires converting the repo into an npm workspace (CLAUDE.md says no root `package.json`); (b) adds a codegen step and a build-order coupling — worth revisiting once the contract stabilises, recorded as future work in ADR-004. |
+| Modular monolith (single NestJS app) | Microservices (per resource or per domain); a gateway/BFF in front | The number of endpoints is not a reason to split: a growing API in one bounded context is still one deploy, and splitting it along the live foreign keys `organizations → users → configurations` would give a distributed monolith (the same coupling over HTTP, without transactions). Microservices pay off for different scaling profiles, fault isolation, independent release cycles of separate teams, or different data/tech requirements. Extraction triggers for this product: map tile/proxy/rendering (different CPU/traffic profile — the first realistic candidate), import/validation of large configurations as a background job, a tenant needing compliance-grade data isolation, organisation management growing into billing/SSO with its own release cycle, or more than two teams blocking each other's releases. The module boundaries and dependency rules that keep this option open are in §7. |
+| Manual TS models on the front | (a) shared workspace package; (b) generated client from Swagger JSON | (a) requires converting the repo into an npm workspace (CLAUDE.md says no root `package.json`); (b) adds a codegen step and a build-order coupling — worth revisiting once the contract stabilises or a third resource appears — the intended tool is `openapi-typescript` (types only, no runtime client, so no build-order coupling), recorded as future work in ADR-004. |
 | PrimeNG 22 under the Community license | (a) stay on PrimeNG 21 (last MIT line); (b) Angular Material 22 (MIT); (c) no UI kit, hand-rolled components | (a) `primeng@21` peers `@angular/core ^21.0.7`, so "stay on MIT" really means "stay on Angular 21" — it is not installable on the regenerated scaffold; (b) is a genuine, license-clean alternative and the designated fallback if the Community license does not apply (A11), rejected today only because the UI is already specified in PrimeNG terms and the swap has no architectural consequences; (c) costs more than either option for two screens. |
 | Angular 22 standalone + zoneless | (a) keep the Angular 15 NgModule app; (b) re-introduce NgModules on top of Angular 22 | **Reversal noted:** the previous revision of this document decided to stay on Angular 15 with NgModules because an upgrade was risky work with no MVP value. That reasoning no longer applies — `front/` has since been regenerated on Angular 22, so the upgrade is already paid for and (a) is moot. (b) would fight the framework's defaults (the scaffold has no `app.module.ts`, `HttpClientModule` and class interceptors are legacy) for zero benefit. The price of the reversal: a newer Node (A10), zoneless change-detection discipline, a Vitest test setup and the PrimeNG licensing question — all addressed below. |
 
@@ -257,7 +258,7 @@ Normative for both `front/` and `back/`. Changes go through the architect.
   columns are never exposed.
 - **Dates:** ISO-8601 UTC strings (`2026-09-23T10:15:30.000Z`).
 - **Auth header:** `Authorization: Bearer <accessToken>` on every endpoint except those marked *public*.
-- **Swagger:** `/api/docs` (JSON at `/api/docs-json`), with `addBearerAuth()`; protected endpoints show a lock.
+- **Swagger:** `/api/docs` (JSON at `/api/docs-json`), with `addBearerAuth()`; protected endpoints show a lock. Served only when `SWAGGER_ENABLED=true` (default `false` outside local dev, like `SEED_ENABLED`); the Nest CLI Swagger plugin (`"plugins": ["@nestjs/swagger"]` in `nest-cli.json`) derives most `@ApiProperty` metadata from the DTO types.
 
 ### 5.2 Endpoint index
 
@@ -597,8 +598,16 @@ Environment (`back/.env`, with a committed `back/.env.example`):
 | `JWT_EXPIRES_IN` | `8h` | |
 | `CORS_ORIGINS` | `http://localhost:4200` | comma-separated; used when not going through the dev proxy |
 | `SEED_ENABLED` | `true` locally, `false` by default/prod | gates `/admin/initdb` |
+| `SWAGGER_ENABLED` | `true` locally, `false` by default/prod | gates `/api/docs` and `/api/docs-json` |
 
 `infra/docker-compose.yml` (repo root) runs `postgres:16` on `5432` with a named volume (plus a separate `config_viewer_test` database for e2e, created by a script mounted into `/docker-entrypoint-initdb.d`, since the image creates only the `POSTGRES_DB` database) — the only infra piece.
+
+**Module boundaries (keep the monolith modular and extractable):**
+- Each feature is a Nest module with explicit `exports`: only its service and DTOs leave the module — never entities or repositories.
+- Dependencies point one way: `auth → users → organizations`, `configurations → organizations`; `seed` may use all data modules and nothing depends on `seed`; `common/` knows nothing about features. No `forwardRef` — it signals a wrong boundary.
+- Cross-module reads go through the owning module's service, never via `@InjectRepository` of another module's entity, and never as a join across the boundary (reference by id only).
+- Enforce the rules with ESLint (`no-restricted-imports` on feature folders); otherwise they erode within months.
+- Prepare for extraction: versioned migrations instead of `synchronize` (§6.1), idempotent writes.
 
 ---
 
@@ -679,6 +688,7 @@ front/src/
   its errors are converted to `VALIDATION_ERROR` with `details`.
 - **Authorization model:** global `JwtAuthGuard` (`APP_GUARD`) → every route is protected unless annotated
   `@Public()` (login, initdb, health, Swagger). Deny-by-default prevents "forgot the guard" bugs.
+- **Swagger exposure:** `/api/docs` and `/api/docs-json` are registered only when `SWAGGER_ENABLED=true`; otherwise they do not exist (404), the same env-gated logic as `SEED_ENABLED`. Without it the full API surface is public in any non-local deployment.
 - **Serialization:** DTO-mapped responses only; never return TypeORM entities directly (prevents
   `passwordHash` leaks).
 - **Logging:** Nest's built-in logger; log auth failures at `warn` without the password; no request-body logging.
@@ -701,7 +711,7 @@ front/src/
    `@nestjs/passport@^10`, `passport`, `passport-jwt`, `bcrypt`, `class-validator`, `class-transformer`
    (+ `@types/passport-jwt`, `@types/bcrypt` as dev).
 2. Bootstrap (`main.ts`): global prefix `api`, URI versioning v1, `ValidationPipe`, global exception filter,
-   CORS from `CORS_ORIGINS`, Swagger at `/api/docs` with `addBearerAuth()`.
+   CORS from `CORS_ORIGINS`, Swagger at `/api/docs` with `addBearerAuth()` (registered only when `SWAGGER_ENABLED=true`; enable the `@nestjs/swagger` Nest CLI plugin in `nest-cli.json`).
 3. `config/` + `.env.example` + boot-time env validation (fail fast if `DATABASE_URL`/`JWT_SECRET` missing).
 4. Entities + modules: `organizations`, `users`, `configurations` per §6 (indexes included). Configure TypeORM with `uuidExtension: 'pgcrypto'`, add `@Check` and username normalisation per §6.1, plus a `data-source.ts` and `typeorm` CLI migration scripts (needed before any shared environment).
 5. Auth module: `POST /auth/login`, `GET /auth/me`, JWT strategy, `JwtAuthGuard` as `APP_GUARD`,
@@ -710,7 +720,7 @@ front/src/
 7. Seed module: `POST /admin/initdb`, `SeedEnabledGuard`, reset-then-insert of the §6.3 dataset,
    response per §5.8.
 8. `GET /health`; `infra/docker-compose.yml` with `postgres:16` and an init script creating `config_viewer_test`.
-9. Tests per §9; verify every §5 response shape.
+9. Tests per §9; verify every §5 response shape. Commit a snapshot of `/api/docs-json` and assert it in e2e, so an undeclared contract change fails the build.
 
 **frontend-developer (`front/`)**
 
