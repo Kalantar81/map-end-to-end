@@ -72,21 +72,21 @@ no microservices — the MVP has one bounded context and a handful of endpoints.
 
 | Concern | Decision | ADR |
 |---|---|---|
-| Authentication | Stateless JWT (HS256), `Authorization: Bearer`, issued by `POST /auth/login`, validated by a Passport JWT strategy + global `JwtAuthGuard` with `@Public()` opt-out. **Short-lived access token (35 min)** carrying a session identity (`sid`) and an absolute session deadline (`sae`, 8 h) | [ADR-001](adr/001-jwt-bearer-authentication.md) |
+| Authentication | Stateless JWT (HS256), `Authorization: Bearer`, issued by `POST /auth/login`, validated by a Passport JWT strategy + global `JwtAuthGuard` with `@Public()` opt-out. **Short-lived access token (35 min)** carrying a session identity (`sid`) and an absolute session deadline (`sae`, 8 h) | [ADR-001](adr/initial-architecture/001-jwt-bearer-authentication.md) |
 | Session keep-alive | **Timed HTTP rotation**: the client calls `POST /auth/refresh` with its current bearer token every **30 min** (5 min of head-room before the 35 min token expires), up to the 8 h absolute deadline. **No refresh-token entity** — rotation is stateless re-signing of the same `sid`/`sae` (§5.11, A12–A13) | ADR-001 |
 | Token storage (front) | In-memory `signal` in `AuthService` + mirror in `sessionStorage` for reload survival; the rotated token replaces both on every refresh. No separate refresh token is ever stored | ADR-001 |
-| Persistence | PostgreSQL 16 via `@nestjs/typeorm` 10 + `typeorm` 0.3 + `pg` driver, entities declared with decorators | [ADR-002](adr/002-postgresql-data-model-and-multitenancy.md) |
+| Persistence | PostgreSQL 16 via `@nestjs/typeorm` 10 + `typeorm` 0.3 + `pg` driver, entities declared with decorators | [ADR-002](adr/initial-architecture/002-postgresql-data-model-and-multitenancy.md) |
 | Multi-tenancy | Dedicated `organizations` table; `users.organizationId` is a required foreign key (`uuid`). **No** org filtering of configurations in MVP | ADR-002 |
-| Seed data | 2 organizations, 10 users split 5/5, 2 configurations | ADR-002 / [ADR-003](adr/003-initdb-seed-endpoint.md) |
+| Seed data | 2 organizations, 10 users split 5/5, 2 configurations | ADR-002 / [ADR-003](adr/initial-architecture/003-initdb-seed-endpoint.md) |
 | `initdb` | Unauthenticated but **feature-flagged** (`SEED_ENABLED`, default `false`); idempotent via *reset-then-insert* | ADR-003 |
-| API style | REST, URI-versioned `/api/v1`, object envelopes (`{ items, total }`), unified error envelope with machine-readable `code` | [ADR-004](adr/004-api-conventions-and-error-format.md) |
+| API style | REST, URI-versioned `/api/v1`, object envelopes (`{ items, total }`), unified error envelope with machine-readable `code` | [ADR-004](adr/initial-architecture/004-api-conventions-and-error-format.md) |
 | Config payload shape | `settings` `jsonb` column (`settings.mapLib`) separates configuration payload from metadata, so future fields are additive | ADR-002 / ADR-004 |
 | API docs | `@nestjs/swagger` 7.x at `/api/docs` with `addBearerAuth()` so protected endpoints are callable from the UI | ADR-004 |
-| Frontend structure | **Standalone** Angular 22 app (no NgModules, zoneless): `core/` singletons + lazy feature routes via `loadComponent`, functional `authGuard` and HTTP interceptors, signals for auth state; no state-management library | [ADR-005](adr/005-frontend-structure-and-primeng.md) |
+| Frontend structure | **Standalone** Angular 22 app (no NgModules, zoneless): `core/` singletons + lazy feature routes via `loadComponent`, functional `authGuard` and HTTP interceptors, signals for auth state; no state-management library | [ADR-005](adr/initial-architecture/005-frontend-structure-and-primeng.md) |
 | UI kit | PrimeNG 22.1.x configured with `providePrimeNG` + a `@primeuix/themes` 3.x preset (Aura), `primeicons` 8, `@angular/cdk` 22 (PrimeNG peer). **Not MIT from v22** — licensing decision in §2.3 / A11 | ADR-005 |
 | Frontend tooling | `@angular/build` (esbuild) for build/serve; `ng test` → `@angular/build:unit-test` with the **Vitest** runner on jsdom; Node `^22.22.3 \|\| ^24.15.0 \|\| >=26.0.0` required | §2.3, A10 |
 | Dev cross-origin | Angular dev proxy `/api` → `http://localhost:3000`; backend CORS also configurable for non-proxied use | ADR-005 |
-| Logging | Nest's built-in logger to **stdout** only — no logging library, no log table in the database, and **no client-side logging or error reporting**: the frontend renders error states and ships nothing anywhere (§9) | — |
+| Logging | Nest's built-in logger to **stdout** only — no logging library, no log table in the database, and **no client-side logging or error reporting**: the frontend renders error states and ships nothing anywhere (§9) | [ADR-006](adr/initial-architecture/006-logging.md) |
 | Package manager | **npm** for both projects (both already have `package-lock.json`) | — |
 
 ### 2.3 Verified version compatibility

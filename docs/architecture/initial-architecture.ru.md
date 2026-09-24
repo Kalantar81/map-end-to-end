@@ -72,21 +72,21 @@ PRD требует минимального, но полного вертика�
 
 | Аспект | Решение | ADR |
 |---|---|---|
-| Аутентификация | Stateless JWT (HS256), `Authorization: Bearer`, выдаётся `POST /auth/login`, валидируется стратегией Passport JWT + глобальным `JwtAuthGuard` с отказом через `@Public()`. **Короткоживущий access-токен (35 мин)**, несущий идентификатор сессии (`sid`) и абсолютный дедлайн сессии (`sae`, 8 ч) | [ADR-001](adr/001-jwt-bearer-authentication.ru.md) |
+| Аутентификация | Stateless JWT (HS256), `Authorization: Bearer`, выдаётся `POST /auth/login`, валидируется стратегией Passport JWT + глобальным `JwtAuthGuard` с отказом через `@Public()`. **Короткоживущий access-токен (35 мин)**, несущий идентификатор сессии (`sid`) и абсолютный дедлайн сессии (`sae`, 8 ч) | [ADR-001](adr/initial-architecture/001-jwt-bearer-authentication.md) |
 | Поддержание сессии | **Ротация токена по HTTP, по таймеру**: клиент вызывает `POST /auth/refresh` со своим текущим bearer-токеном каждые **30 мин** (запас 5 мин до истечения 35-минутного токена) — до наступления абсолютного дедлайна в 8 ч. **Отдельной сущности refresh-токена нет** — ротация это stateless переподписывание тех же `sid`/`sae` (§5.11, A12–A13) | ADR-001 |
 | Хранение токена (фронт) | In-memory `signal` в `AuthService` + зеркало в `sessionStorage` для переживания перезагрузки; при каждом обновлении ротированный токен заменяет оба. Отдельный refresh-токен не хранится нигде | ADR-001 |
-| Хранилище | PostgreSQL 16 через `@nestjs/typeorm` 10 + `typeorm` 0.3 + драйвер `pg`, сущности объявляются декораторами | [ADR-002](adr/002-postgresql-data-model-and-multitenancy.ru.md) |
+| Хранилище | PostgreSQL 16 через `@nestjs/typeorm` 10 + `typeorm` 0.3 + драйвер `pg`, сущности объявляются декораторами | [ADR-002](adr/initial-architecture/002-postgresql-data-model-and-multitenancy.md) |
 | Мульти-тенантность | Отдельная таблица `organizations`; `users.organizationId` — обязательный внешний ключ (`uuid`). Фильтрации конфигураций по организации в MVP **нет** | ADR-002 |
-| Тестовые данные | 2 организации, 10 пользователей в разбивке 5/5, 2 конфигурации | ADR-002 / [ADR-003](adr/003-initdb-seed-endpoint.ru.md) |
+| Тестовые данные | 2 организации, 10 пользователей в разбивке 5/5, 2 конфигурации | ADR-002 / [ADR-003](adr/initial-architecture/003-initdb-seed-endpoint.md) |
 | `initdb` | Без аутентификации, но **за feature-флагом** (`SEED_ENABLED`, по умолчанию `false`); идемпотентен по схеме *сброс-затем-вставка* | ADR-003 |
-| Стиль API | REST, URI-версионирование `/api/v1`, объектные конверты (`{ items, total }`), единый конверт ошибки с машиночитаемым `code` | [ADR-004](adr/004-api-conventions-and-error-format.ru.md) |
+| Стиль API | REST, URI-версионирование `/api/v1`, объектные конверты (`{ items, total }`), единый конверт ошибки с машиночитаемым `code` | [ADR-004](adr/initial-architecture/004-api-conventions-and-error-format.md) |
 | Форма полезной нагрузки конфигурации | Колонка `settings` типа `jsonb` (`settings.mapLib`) отделяет полезную нагрузку конфигурации от метаданных, поэтому будущие поля аддитивны | ADR-002 / ADR-004 |
 | Документация API | `@nestjs/swagger` 7.x на `/api/docs` с `addBearerAuth()`, чтобы защищённые эндпоинты были вызываемы из UI | ADR-004 |
-| Структура фронтенда | **Standalone**-приложение на Angular 22 (без NgModules, zoneless): синглтоны в `core/` + ленивые маршруты фич через `loadComponent`, функциональные `authGuard` и HTTP-интерцепторы, signals для состояния аутентификации; без библиотеки управления состоянием | [ADR-005](adr/005-frontend-structure-and-primeng.ru.md) |
+| Структура фронтенда | **Standalone**-приложение на Angular 22 (без NgModules, zoneless): синглтоны в `core/` + ленивые маршруты фич через `loadComponent`, функциональные `authGuard` и HTTP-интерцепторы, signals для состояния аутентификации; без библиотеки управления состоянием | [ADR-005](adr/initial-architecture/005-frontend-structure-and-primeng.md) |
 | UI-набор | PrimeNG 22.1.x, настраивается через `providePrimeNG` + пресет `@primeuix/themes` 3.x (Aura), `primeicons` 8, `@angular/cdk` 22 (peer PrimeNG). **С v22 не MIT** — решение по лицензии в §2.3 / A11 | ADR-005 |
 | Инструментарий фронтенда | `@angular/build` (esbuild) для сборки/serve; `ng test` → билдер `@angular/build:unit-test` с раннером **Vitest** на jsdom; требуется Node `^22.22.3 \|\| ^24.15.0 \|\| >=26.0.0` | §2.3, A10 |
 | Cross-origin в разработке | Dev-прокси Angular `/api` → `http://localhost:3000`; CORS на бэкенде также настраивается для использования без прокси | ADR-005 |
-| Логирование | Встроенный логгер Nest только в **stdout** — без библиотеки логирования, без таблицы логов в БД и **без клиентского логирования и отправки ошибок**: фронтенд отрисовывает состояния ошибок и никуда ничего не отправляет (§9) | — |
+| Логирование | Встроенный логгер Nest только в **stdout** — без библиотеки логирования, без таблицы логов в БД и **без клиентского логирования и отправки ошибок**: фронтенд отрисовывает состояния ошибок и никуда ничего не отправляет (§9) | [ADR-006](adr/initial-architecture/006-logging.md) |
 | Пакетный менеджер | **npm** для обоих проектов (в обоих уже есть `package-lock.json`) | — |
 
 ### 2.3 Проверенная совместимость версий
