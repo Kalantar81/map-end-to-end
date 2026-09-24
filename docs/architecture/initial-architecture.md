@@ -72,8 +72,9 @@ no microservices — the MVP has one bounded context and a handful of endpoints.
 
 | Concern | Decision | ADR |
 |---|---|---|
-| Authentication | Stateless JWT (HS256), `Authorization: Bearer`, issued by `POST /auth/login`, validated by a Passport JWT strategy + global `JwtAuthGuard` with `@Public()` opt-out | [ADR-001](adr/001-jwt-bearer-authentication.md) |
-| Token storage (front) | In-memory `signal` in `AuthService` + mirror in `sessionStorage` for reload survival; no refresh token in MVP | ADR-001 |
+| Authentication | Stateless JWT (HS256), `Authorization: Bearer`, issued by `POST /auth/login`, validated by a Passport JWT strategy + global `JwtAuthGuard` with `@Public()` opt-out. **Short-lived access token (35 min)** carrying a session identity (`sid`) and an absolute session deadline (`sae`, 8 h) | [ADR-001](adr/001-jwt-bearer-authentication.md) |
+| Session keep-alive | **Timed HTTP rotation**: the client calls `POST /auth/refresh` with its current bearer token every **30 min** (5 min of head-room before the 35 min token expires), up to the 8 h absolute deadline. **No refresh-token entity** — rotation is stateless re-signing of the same `sid`/`sae` (§5.11, A12–A13) | ADR-001 |
+| Token storage (front) | In-memory `signal` in `AuthService` + mirror in `sessionStorage` for reload survival; the rotated token replaces both on every refresh. No separate refresh token is ever stored | ADR-001 |
 | Persistence | PostgreSQL 16 via `@nestjs/typeorm` 10 + `typeorm` 0.3 + `pg` driver, entities declared with decorators | [ADR-002](adr/002-postgresql-data-model-and-multitenancy.md) |
 | Multi-tenancy | Dedicated `organizations` table; `users.organizationId` is a required foreign key (`uuid`). **No** org filtering of configurations in MVP | ADR-002 |
 | Seed data | 2 organizations, 10 users split 5/5, 2 configurations | ADR-002 / [ADR-003](adr/003-initdb-seed-endpoint.md) |
@@ -128,6 +129,11 @@ Checked against the npm registry on 2026-09-23 (`npm view`; peer-dependency and 
   (the backend already pins `reflect-metadata ^0.2.0`); we keep **7.4.x** as the conservative pairing for Nest 10.
 - `@nestjs/jwt@10.2.0`, `@nestjs/passport@10.0.3`, `@nestjs/config@3.x` → all peer-compatible with Nest 10
   (`back/package.json` is still NestJS 10 + TypeScript 5.1 + Jest, exactly as assumed in §1).
+- **Session keep-alive (§5.11) adds no new transport dependency on either side.** On the backend
+  `POST /auth/refresh` reuses the already-selected `@nestjs/jwt@10.2.0`; the only addition is
+  `@nestjs/throttler@10.0.1` (peers `@nestjs/common ^10.0.0`, `@nestjs/core ^10.0.0`, `reflect-metadata ^0.1.13 ||
+  ^0.2.0`) for the per-`sid` rate limit, and it is optional. On the frontend the refresh schedule is a plain
+  `setTimeout` plus the existing `HttpClient` — **zero new frontend dependencies**.
 
 ### 2.4 Answers to the PRD's open questions
 
@@ -136,7 +142,7 @@ Checked against the npm registry on 2026-09-23 (`npm view`; peer-dependency and 
 | #1 Config schema will grow | Payload isolated in the `settings` jsonb column; list endpoint returns metadata only; detail returns `settings`. New fields are additive and non-breaking. |
 | #2 Is `initdb` protected? | Not auth-protected, but disabled unless `SEED_ENABLED=true`; returns `404 SEED_DISABLED` when off. Production sets it to `false`. |
 | #3 Is `initdb` idempotent? | Yes — in one transaction it truncates the three tables and re-inserts the fixed dataset. Repeated calls converge to the same state (10 users, 2 configurations, 2 organizations). Destructive by design; guarded by the same flag. |
-| #4 Auth mechanism | JWT bearer, 8h expiry, no refresh; `sessionStorage` on the client. See ADR-001 for the XSS trade-off and the migration path to httpOnly cookies. |
+| #4 Auth mechanism | JWT bearer; **access token lives 35 min**, rotated by the client calling `POST /auth/refresh` every **30 min**, up to an **absolute session deadline of 8 h**. The token is kept in a signal + `sessionStorage` on the client. There is **no refresh-token credential and no server-side session store** — rotation re-signs the `sid`/`sae` claims the token already carries (§5.11, A12). See ADR-001 for the XSS trade-off and the migration path to httpOnly cookies. |
 | #5 Dropdown labeling | `Configuration.name` is the label, `Configuration.id` the value; `description` is available as secondary text. |
 | #6 Password storage | `bcrypt` (cost 10). `passwordHash` has `select: false`; it is never returned by any endpoint or serialized into a DTO. |
 | #7 DB connection config | `@nestjs/config` + `.env`; `DATABASE_URL` required and validated at boot; `infra/docker-compose.yml` provides local PostgreSQL 16. |
@@ -172,6 +178,16 @@ These are architect assumptions, not product decisions. Flag to product-manager 
 - **A11.** We assume the team qualifies for PrimeNG's free **Community** license (§2.3). If it does not, the
   options are a commercial seat or swapping the UI kit for Angular Material 22 (MIT). That swap is cheap on day
   one and expensive after two screens exist — nothing in the API contract or the backend depends on the UI kit.
+- **A12 (confirmed by the user).** *What "refresh every 30 minutes" means.* The PRD says nothing about session duration or refresh, so
+  the semantics are an architect decision: the **access token TTL drops from 8 h to 35 min**, and the client
+  re-issues the token by calling `POST /auth/refresh` every **30 min** (5 min of head-room before expiry). The
+  **total session length stays 8 h** — an absolute deadline (`sae` claim) that rotation cannot extend, so "refresh
+  forever" is explicitly *not* what is built. A hard cap is chosen over a sliding window
+  because there is no token revocation: with a sliding window a stolen token could be refreshed indefinitely. A
+  sliding window only makes sense together with server-side sessions (the `sid` claim is the hook for that later).
+- **A13.** Sessions are per browser tab. `sessionStorage` is per-tab, so tabs already hold independent sessions;
+  each tab therefore runs its own refresh timer and rotates its own token. Acceptable at PRD scale (tens of
+  users); the per-`sid` rate limit in §5.11 (default 10 req/min) caps the obvious abuse.
 
 ---
 
@@ -190,6 +206,7 @@ These are architect assumptions, not product decisions. Flag to product-manager 
 | Manual TS models on the front | (a) shared workspace package; (b) generated client from Swagger JSON | (a) requires converting the repo into an npm workspace (CLAUDE.md says no root `package.json`); (b) adds a codegen step and a build-order coupling — worth revisiting once the contract stabilises or a third resource appears — the intended tool is `openapi-typescript` (types only, no runtime client, so no build-order coupling), recorded as future work in ADR-004. |
 | PrimeNG 22 under the Community license | (a) stay on PrimeNG 21 (last MIT line); (b) Angular Material 22 (MIT); (c) no UI kit, hand-rolled components | (a) `primeng@21` peers `@angular/core ^21.0.7`, so "stay on MIT" really means "stay on Angular 21" — it is not installable on the regenerated scaffold; (b) is a genuine, license-clean alternative and the designated fallback if the Community license does not apply (A11), rejected today only because the UI is already specified in PrimeNG terms and the swap has no architectural consequences; (c) costs more than either option for two screens. |
 | Angular 22 standalone + zoneless | (a) keep the Angular 15 NgModule app; (b) re-introduce NgModules on top of Angular 22 | **Reversal noted:** the previous revision of this document decided to stay on Angular 15 with NgModules because an upgrade was risky work with no MVP value. That reasoning no longer applies — `front/` has since been regenerated on Angular 22, so the upgrade is already paid for and (a) is moot. (b) would fight the framework's defaults (the scaffold has no `app.module.ts`, `HttpClientModule` and class interceptors are legacy) for zero benefit. The price of the reversal: a newer Node (A10), zoneless change-detection discipline, a Vitest test setup and the PrimeNG licensing question — all addressed below. |
+| Client-timed `POST /auth/refresh` | (a) token rotation pushed by the server over a WebSocket channel; (b) silent polling of `/auth/me`; (c) refresh token in an httpOnly cookie + `/auth/refresh`; (d) keep the 8 h token with no refresh at all | (a) **WebSocket delivers the identical user-visible behaviour for a much larger bill**: a gateway plus a custom adapter, an `Upgrade`-capable path through every proxy/load balancer/dev proxy, handshake auth that cannot use HTTP headers, reconnect-with-backoff and a liveness watchdog on the client, and two code paths for session continuity (the socket plus an HTTP refresh that has to exist as a fallback anyway). What it would buy — the server owning the schedule and a free presence signal — is worth little while the only server-initiated event is "here is a new token". **Revisit when a second real-time need appears** (live configuration updates, notifications, presence, forced logout): the channel is then added *additively* and rotation can move onto it, with this endpoint kept as the fallback. (b) burns a request per interval for a payload that is not the point and still needs a rotation endpoint. (c) is the genuinely more secure option (the refresh credential becomes unreadable by injected scripts) and remains the recommended hardening step, but it needs CSRF protection and `SameSite`/credentials handling across `:4200`↔`:3000` — the same cost that deferred httpOnly cookies in the row above. (d) is the current state and is what the 30-minute requirement supersedes. The price of the chosen option is in §4. |
 
 ---
 
@@ -205,13 +222,34 @@ These are architect assumptions, not product decisions. Flag to product-manager 
   (a `configuration_organizations` join table + one query filter + one guard), not a migration.
 - Adding configuration fields later touches `settings` only: one `settings` type, one DTO, one UI block.
 - Swagger with bearer auth lets QA execute the full flow without the frontend (US-4, success metric).
+- **The blast radius of a stolen token shrinks from 8 h to 35 min** — the single most valuable side effect of the
+  change, and a partial mitigation of the `sessionStorage`/XSS debt below.
+- **Session keep-alive adds no transport, no dependency and no infrastructure requirement**: one body-less
+  `POST`, one client timer, and the same stateless JWT everywhere. It is ~20 lines of backend and ~60 of frontend.
 
 **What it costs / what we accept**
 
 - **JWT in `sessionStorage` is readable by injected scripts (XSS).** Accepted for an internal MVP with no
   sensitive data; mitigation path (httpOnly cookie + CSRF) documented in ADR-001. Must be revisited before
   any production/internet-facing deployment — this is the single largest known security debt.
-- **No token revocation / refresh.** A stolen token is valid until expiry (8h); logout is client-side only.
+- **Still no token revocation.** Rotation shortens exposure but does not revoke: a stolen token stays valid until
+  its 35 min `exp`, and logout remains client-side only. True revocation needs server-side session state — the
+  `sid` claim is the hook that makes adding it additive (§6.4).
+- **The client, not the server, owns the schedule.** Rotation happens only if the frontend timer runs, and the
+  interval is derived on the client from `expiresIn` (§5.11). Changing the cadence is still a backend TTL change,
+  but adding a server-initiated "terminate this session now" would need either a frontend release or the push
+  channel deferred in §3.
+- **Five minutes is all the slack there is.** The token is rotated at 30 min and dies at 35 min; anything that
+  delays the call by more than 5 min — a suspended laptop, a frozen or throttled background tab, a long offline
+  spell — lets the token expire, and **an expired token cannot be refreshed** (§5.11 rule 1). The user is then
+  redirected to `/login`. The `visibilitychange`/`focus` check in §8 removes the common cases cheaply but cannot
+  remove the class of failure; the honest statement is "a tab that sleeps past 35 min logs you out".
+- **Rotation is neither revocation nor an extension.** The old token stays valid until its own `exp` (up to 5 min
+  of overlap — which is exactly why the 35 min TTL exceeds the 30 min interval, and what makes rotation race-free
+  for in-flight requests), and no number of refreshes moves the 8 h `sae` deadline: after 8 h everyone logs in
+  again, by design (A12).
+- **"Session expired" redirects become more frequent than they were.** Users hit the US-1/US-2 redirect-to-login
+  path after 35 min of a dead tab instead of after 8 h. The behaviour is unchanged, the frequency is not.
 - **`initdb` is destructive.** If `SEED_ENABLED` is ever true in an environment with real data, that data is
   deleted. The flag defaults to `false` and boot-time config validation makes it explicit.
 - **Type duplication** between `back/src/**/dto` and `front/src/app/core/api/api.models.ts`. Drift risk is
@@ -270,6 +308,7 @@ Normative for both `front/` and `back/`. Changes go through the architect.
 | 4 | GET | `/api/v1/configurations/{id}` | bearer | US-3 |
 | 5 | POST | `/api/v1/admin/initdb` | public, flag-gated | US-5 |
 | 6 | GET | `/api/v1/health` | public | ops convenience |
+| 7 | POST | `/api/v1/auth/refresh` | bearer | session keep-alive, called every 30 min (§5.11, A12) |
 
 ### 5.3 Error envelope (all non-2xx responses)
 
@@ -291,6 +330,8 @@ Error codes used in the MVP:
 | `VALIDATION_ERROR` | 400 | Body/param failed `class-validator`; `details` lists messages |
 | `INVALID_CREDENTIALS` | 401 | `/auth/login` with unknown username or wrong password |
 | `UNAUTHENTICATED` | 401 | Missing/invalid/expired bearer token on a protected endpoint |
+| `SESSION_EXPIRED` | 401 | `/auth/refresh` called after the absolute session deadline (`sae`) — the client must log in again, not retry |
+| `RATE_LIMITED` | 429 | Too many `/auth/refresh` calls for one `sid` (§5.11) — the client backs off; it must **not** log out |
 | `NOT_FOUND` | 404 | Unknown configuration id, or unknown route |
 | `SEED_DISABLED` | 404 | `/admin/initdb` called while `SEED_ENABLED=false` |
 | `INTERNAL_ERROR` | 500 | Unhandled exception (message is generic; details never leak internals) |
@@ -312,7 +353,7 @@ Validation: `username` — required, string, 3..64 chars, trimmed, lowercased se
 {
   "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "tokenType": "Bearer",
-  "expiresIn": 28800,                       // seconds
+  "expiresIn": 2100,                       // seconds
   "user": {
     "id": "3f1c2a7e-9b5d-4c8a-a1e2-7d0f4b6c9e21",
     "username": "user01",
@@ -323,11 +364,24 @@ Validation: `username` — required, string, 3..64 chars, trimmed, lowercased se
 ```
 Errors: `400 VALIDATION_ERROR`, `401 INVALID_CREDENTIALS`.
 
-JWT payload (HS256, `JWT_SECRET`, `expiresIn = JWT_EXPIRES_IN`, default `8h`):
+JWT payload (HS256, `JWT_SECRET`, `expiresIn = JWT_ACCESS_TTL`, default `35m`):
 ```jsonc
-{ "sub": "<userId>", "username": "user01", "orgId": "<organizationId>", "iat": 1790000000, "exp": 1790028800 }
+{
+  "sub": "<userId>",
+  "username": "user01",
+  "orgId": "<organizationId>",
+  "sid": "9c1f0b7e-4a2d-4f6b-8e3c-5d7a1b9c0e2f",   // session id — stable across every rotation
+  "sae": 1790028800,                                // session absolute expiry (epoch s) — rotation may NOT extend it
+  "iat": 1790000000,
+  "exp": 1790002100                                 // 35 min
+}
 ```
 `orgId` is carried now, unused for filtering in the MVP, so the future increment needs no token change.
+`sid` and `sae` are added by this revision: `sid` identifies the login session across rotations (useful for log
+correlation today, and the hook for server-side revocation tomorrow — §6.4); `sae` is set once at login to
+`iat + JWT_SESSION_MAX_AGE` (default `8h`) and is copied verbatim into every rotated token, which is what makes
+"refresh forever" impossible without any server-side storage (A12). Rotation is therefore a pure function of the
+presented token — no refresh-token entity exists (§5.11, §6.4).
 
 ### 5.5 `GET /api/v1/auth/me` — bearer
 
@@ -456,8 +510,8 @@ export interface ConfigurationDetail {
 }
 
 export type ApiErrorCode =
-  | 'VALIDATION_ERROR' | 'INVALID_CREDENTIALS' | 'UNAUTHENTICATED'
-  | 'NOT_FOUND' | 'SEED_DISABLED' | 'INTERNAL_ERROR';
+  | 'VALIDATION_ERROR' | 'INVALID_CREDENTIALS' | 'UNAUTHENTICATED' | 'SESSION_EXPIRED'
+  | 'NOT_FOUND' | 'SEED_DISABLED' | 'RATE_LIMITED' | 'INTERNAL_ERROR';
 
 export interface ApiError {
   statusCode: number;
@@ -467,7 +521,87 @@ export interface ApiError {
   timestamp: string;
   path: string;
 }
+
+/* ── session keep-alive (§5.11) ────────────────────────────────────────────── */
+
+/** Response of the body-less POST /auth/refresh. */
+export interface SessionTokenPayload {
+  accessToken: string;
+  tokenType: 'Bearer';
+  expiresIn: number;             // seconds until this token's exp (2100 with the default TTL)
+  issuedAt: string;              // ISO-8601
+  sessionExpiresAt: string;      // ISO-8601 absolute deadline (`sae`) — never moves
+}
+
+export type RefreshResponse = SessionTokenPayload;
 ```
+
+### 5.11 `POST /api/v1/auth/refresh` — bearer
+
+The session keep-alive endpoint. No request body; the only credential is the **current, still-valid** access token
+in the `Authorization: Bearer` header. It returns a freshly signed token carrying the same session identity, which
+is what keeps a logged-in user working past the 35 min access-token TTL without a second credential and without any
+server-side session state.
+
+`200 OK` — `SessionTokenPayload`:
+```jsonc
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "tokenType": "Bearer",
+  "expiresIn": 2100,                               // seconds until this token's exp
+  "issuedAt": "2026-09-24T10:15:30.000Z",
+  "sessionExpiresAt": "2026-09-24T18:00:00.000Z"   // absolute deadline (`sae`) — never moves
+}
+```
+
+**Server rules (normative; one implementation — `SessionTokenService.rotate(claims)`):**
+
+1. The presented token must be currently valid (signature + `exp`) — it is checked by the same global
+   `JwtAuthGuard` as every other protected route. An **expired token is not renewable** → `401 UNAUTHENTICATED`;
+   there is no separate refresh credential that outlives the access token, which is the deliberate consequence of
+   having no refresh-token entity (§6.4). The client must log in again.
+2. `now >= sae` → `401 SESSION_EXPIRED`, even when the access token itself is still valid. This is the 8 h
+   ceiling. The client logs out and must **not** retry — it is the one case where the two 401 codes must be
+   distinguished on the client.
+3. Otherwise a new token is signed with the **same** `sub`/`username`/`orgId`/`sid`/`sae` and a fresh `iat`/`exp`
+   (`JWT_ACCESS_TTL`). If `sae - now < JWT_ACCESS_TTL`, `exp` is clamped to `sae`, so a token never outlives its
+   session and `expiresIn` simply shrinks to the remaining seconds as the deadline approaches.
+4. The old token stays valid until its own `exp` (up to 5 min of overlap). This is intentional: it makes rotation
+   race-free for requests that are already in flight. It also means rotation is **not** revocation.
+5. Rate limit: `@nestjs/throttler`, `AUTH_REFRESH_RATE_LIMIT` (default 10) requests per minute per `sid` →
+   `429 RATE_LIMITED`. A normal client calls this twice an hour.
+
+Errors: `401 UNAUTHENTICATED`, `401 SESSION_EXPIRED`, `429 RATE_LIMITED`.
+
+**Client rules (normative — the schedule lives on the client):**
+
+1. After a successful login, and after a successful `restoreSession()`, schedule the next call at
+   `expiresIn - 300` seconds (floor 60 s). With the default 35 min TTL that is exactly the required **30 min**.
+   Deriving the interval from `expiresIn` rather than hard-coding 1 800 000 means a server-side TTL change needs no
+   frontend release, and the clamp in server rule 3 is handled for free near the 8 h deadline.
+2. Reschedule from every successful response; cancel the timer on logout.
+3. **Do not trust the timer alone.** `setTimeout` is throttled in hidden tabs and does not run at all in a frozen
+   or sleeping one, so on `visibilitychange` → visible and on `window.focus` the client compares the stored
+   token's `exp` with `Date.now()` and refreshes immediately when less than 5 min remain (§8).
+4. All refresh triggers share a single in-flight request, so a waking tab issues one `POST /auth/refresh`, not
+   three.
+5. Error handling: `401 SESSION_EXPIRED` from any endpoint → log out and redirect to `/login?returnUrl=<current URL>` with a
+   "session expired" message, never retry (after login the user returns to the page they were on);
+   `401 UNAUTHENTICATED` → one single-flight refresh attempt and, if it succeeds, replay the original request,
+   otherwise log out; `429 RATE_LIMITED` → keep the current token and back off, do **not** log out.
+
+**Lifecycle summary**
+
+| Event | Behaviour |
+|---|---|
+| Login succeeds | `AuthService` stores the token and starts the refresh timer |
+| Page reload | `restoreSession()` validates via `GET /auth/me`, then starts the timer |
+| Token rotated | `AuthService.setToken()` updates the signal + `sessionStorage`; subsequent HTTP requests pick it up from the interceptor. No re-render, no navigation |
+| Tab returns from background/sleep | `exp` is re-checked on `visibilitychange`/`focus`: refresh now if under 5 min remain, log out if it already expired |
+| Offline or backend down at refresh time | retried on the next tick and on the next request; if the token expires first, the user is redirected to `/login` |
+| Absolute deadline reached | the next refresh returns `401 SESSION_EXPIRED` → client logs out |
+| User logs out | timer cancelled, signal and `sessionStorage` cleared. The token itself is **not** revoked (it dies with its 35 min `exp`) |
+| Backend restarts | nothing is lost — no server-side session state exists, and the next refresh succeeds as usual |
 
 ---
 
@@ -548,6 +682,30 @@ Configurations (2):
 
 (The list endpoint sorts by `name`, so `ArcGIS Default` appears first in the dropdown.)
 
+### 6.4 No refresh-token table (decision)
+
+**No new table is introduced for session keep-alive**, and that is a deliberate decision rather than an omission.
+
+A refresh-token entity (`refresh_tokens`: `id`, `userId`, `tokenHash`, `expiresAt`, `rotatedFrom`, `revokedAt`,
+`userAgent`) exists to solve two problems: (1) let a *long-lived* credential outlive a short-lived access token,
+and (2) allow revocation and rotation-reuse detection. Neither applies here:
+
+- Rotation is driven by a request that is **already authenticated by a currently-valid access token**. That
+  token *is* the proof of session continuity, so no second credential has to exist, be stored, be hashed, or be
+  transmitted. This is the main reason the design can stay storage-free.
+- The 8 h ceiling is enforced by the `sae` claim, which rotation copies but never extends — no row is needed to
+  remember when the session started.
+- Revocation is *already* out of scope (A6, §4): the MVP has no logout-everywhere, no admin kill-switch and no
+  compliance requirement. Adding a table that nothing reads would be pure ceremony.
+
+Cost of this choice, stated plainly: **a stolen token cannot be revoked** before its 35 min `exp`, and there is no
+audit trail of sessions. If either becomes a requirement, the additive change is small and already designed for:
+create `sessions (sid PK, userId FK, issuedAt, absoluteExpiry, revokedAt, lastSeenAt)`, have login insert a row,
+have `JwtAuthGuard` and `rotate()` reject tokens whose `sid` is revoked or missing, and have logout set
+`revokedAt`. The `sid` claim added in §5.4 exists precisely so this can be done without reissuing tokens or
+changing the API contract. It converts auth to stateful — one indexed lookup per request — which is why it is not
+being paid for today.
+
 ---
 
 ## 7. Backend structure (`back/`)
@@ -571,10 +729,11 @@ back/src/
     users.service.ts                     # findByUsername(+hash), findById
     users.module.ts
   auth/
-    auth.module.ts  auth.controller.ts  auth.service.ts
+    auth.module.ts  auth.controller.ts  auth.service.ts   # POST /auth/login, GET /auth/me, POST /auth/refresh
+    session-token.service.ts             # rotate(claims) — the ONE place that re-signs a non-login token
     strategies/jwt.strategy.ts
     guards/jwt-auth.guard.ts             # registered as APP_GUARD (deny by default)
-    dto/{login.request.dto.ts,login.response.dto.ts,authenticated-user.dto.ts}
+    dto/{login.request.dto.ts,login.response.dto.ts,authenticated-user.dto.ts,session-token.dto.ts}
     decorators/current-user.decorator.ts
   configurations/
     entities/configuration.entity.ts
@@ -588,6 +747,11 @@ back/src/
   health/health.controller.ts
 ```
 
+**Session keep-alive adds no module.** `POST /auth/refresh` is a third route on `AuthController`, and
+`SessionTokenService` is the single place that re-signs a token. A separate `session/` module would have to depend
+on `auth` for claims and signing while `auth` depends on it for the controller — exactly the cycle that produces
+`forwardRef`, and it buys nothing at this size.
+
 Environment (`back/.env`, with a committed `back/.env.example`):
 
 | Var | Example | Notes |
@@ -595,7 +759,9 @@ Environment (`back/.env`, with a committed `back/.env.example`):
 | `PORT` | `3000` | |
 | `DATABASE_URL` | `postgres://config_viewer:config_viewer@localhost:5432/config_viewer` | required, validated |
 | `JWT_SECRET` | *(dev value in `.env.example`)* | required, min 32 chars |
-| `JWT_EXPIRES_IN` | `8h` | |
+| `JWT_ACCESS_TTL` | `35m` | access-token lifetime and the source of `expiresIn`; the client refreshes 5 min before it expires, so values under `10m` are rejected at boot (replaces `JWT_EXPIRES_IN`) |
+| `JWT_SESSION_MAX_AGE` | `8h` | absolute session deadline written to the `sae` claim; rotation cannot extend it |
+| `AUTH_REFRESH_RATE_LIMIT` | `10` | `POST /auth/refresh` calls per minute per `sid` (§5.11); exceeded → `429 RATE_LIMITED` |
 | `CORS_ORIGINS` | `http://localhost:4200` | comma-separated; used when not going through the dev proxy |
 | `SEED_ENABLED` | `true` locally, `false` by default/prod | gates `/admin/initdb` |
 | `SWAGGER_ENABLED` | `true` locally, `false` by default/prod | gates `/api/docs` and `/api/docs-json` |
@@ -638,6 +804,7 @@ front/src/
       auth/auth.guard.ts      # authGuard: CanActivateFn → redirect to /login with returnUrl
       http/auth.interceptor.ts    # HttpInterceptorFn — adds Authorization: Bearer when a token exists
       http/error.interceptor.ts   # HttpInterceptorFn — 401 → logout + redirect; maps ApiError for the UI
+      session/session.service.ts            # start()/stop(); refresh timer + visibilitychange check
       services/configurations.service.ts    # list(), getById()
     features/
       auth/login-page.ts                        # standalone component, lazy-loaded
@@ -677,6 +844,29 @@ front/src/
   (a PrimeNG peer that is not installed automatically). **Not** `@angular/animations`. Theming is code-only:
   `providePrimeNG({ theme: { preset: Aura } })` with `Aura` from `@primeuix/themes/aura`; the only style entry to
   add in `angular.json` is `primeicons/primeicons.css` — the `primeng/resources/**` theme CSS files are gone.
+- **Session keep-alive (§5.11):** `SessionService` is started by `AuthService` after a successful login or a
+  successful `restoreSession()`, and stopped on logout — page components know nothing about it. It owns one
+  `setTimeout` scheduled at `expiresIn - 300` s (floor 60 s, i.e. 30 min with the default TTL), calls
+  `POST /auth/refresh`, and hands the response to `AuthService.setToken(payload)`, which updates the token
+  `signal` and `sessionStorage` in one place — the existing `authInterceptor` then picks the new token up with no
+  change. **The `user` signal does not change, so rotation triggers no re-render and no navigation.**
+- **Background tabs — the one real pitfall.** Browsers clamp `setTimeout` in hidden tabs (≥ 1 min, and a frozen
+  or sleeping tab does not run timers at all), so a 5 min margin cannot rest on the timer alone. The fix is
+  deliberately small: `SessionService` also subscribes to `document.visibilitychange` (→ visible) and
+  `window.focus`, decodes the stored token's `exp` once, and refreshes immediately when less than 5 min remain.
+  If `exp` has already passed there is nothing to refresh — it clears the session and redirects to `/login`
+  (§4, accepted consequence).
+- **Single-flight:** timer, visibility check and interceptor all go through one shared in-flight request
+  (`shareReplay(1)` over the refresh call), so a waking tab issues one `POST /auth/refresh`, not three.
+- **Interceptors:** `authInterceptor` attaches the current token; `errorInterceptor` maps `ApiError` and, on
+  `401 UNAUTHENTICATED` (excluding `/auth/login` and `/auth/refresh` themselves), makes **one** single-flight
+  refresh attempt and replays the request — if that fails it calls `AuthService.logout()` and navigates to
+  `/login`. `401 SESSION_EXPIRED` logs out immediately with no retry; `429 RATE_LIMITED` surfaces as an error but
+  must never log the user out. Under zoneless CD every one of these paths must end in a signal write — never a
+  direct field assignment.
+- **Never leak a timer:** `SessionService` is `providedIn: 'root'`, clears its timeout and removes its event
+  listeners in `ngOnDestroy` / `DestroyRef` and on logout. A refresh timer that survives logout is the most likely
+  bug here and is worth an explicit unit test.
 - **No `SharedModule`:** each standalone component imports exactly the PrimeNG components it uses
   (`Button`, `InputText`, `Password`, `Select`, `Card`, `Message`, `ProgressSpinner`).
 
@@ -700,6 +890,22 @@ front/src/
     interceptors, configured in `TestBed` with `provideHttpClient(withInterceptors([...]))` +
     `provideHttpClientTesting()` (`HttpClientTestingModule` is legacy); component tests for the three states of
     the selection page. Zoneless: `await fixture.whenStable()` before asserting rendered output.
+- **Refresh endpoint security (§5.11):** `POST /auth/refresh` is protected by the same global `JwtAuthGuard` as
+  every other business route — there is no second credential, no cookie and no special-case guard, so the attack
+  surface added by keep-alive is one throttled `POST`. Keep the `sae` check inside `rotate()` rather than in the
+  controller, throttle per `sid`, and never log the `Authorization` header or the issued token.
+- **Token rotation is one code path:** `SessionTokenService.rotate()` is the only place that signs a non-login
+  token. Two implementations of the `sae` clamp would guarantee a security bug.
+- **Testing session keep-alive** (in addition to the testing bullet above):
+  - back — unit tests for `rotate()` (claims preserved, `sae` never extended, `exp` clamped to `sae`, expired
+    token rejected with `UNAUTHENTICATED`, past-`sae` token rejected with `SESSION_EXPIRED`); an e2e test that
+    logs in, calls `POST /auth/refresh`, and verifies the new token is accepted by a protected endpoint while the
+    old one still works until its `exp`. Use a short `JWT_ACCESS_TTL`/`JWT_SESSION_MAX_AGE` in tests rather than
+    waiting 30 minutes.
+  - front — unit tests for `SessionService` with fake timers: the call fires at `expiresIn - 300` s, a successful
+    response updates the signal and `sessionStorage`, `SESSION_EXPIRED` logs out, logout cancels the timer and
+    detaches listeners, the `visibilitychange` path refreshes a nearly-expired token, and concurrent triggers
+    produce exactly one request.
 - **Definition of "contract-compliant":** responses match §5 exactly (field names, envelope, error `code`s).
 
 ---
@@ -722,6 +928,13 @@ front/src/
 8. `GET /health`; `infra/docker-compose.yml` with `postgres:16` and an init script creating `config_viewer_test`.
 9. Tests per §9; verify every §5 response shape. Commit a snapshot of `/api/docs-json` and assert it in e2e, so an undeclared contract change fails the build.
 
+10. **Session keep-alive (§5.11):** add `@nestjs/throttler@^10` — no other new dependency. Add `sid`/`sae` to the
+    login payload, implement `SessionTokenService.rotate()` in `auth/` (the only re-signing path; it owns the
+    `sae` check and the `exp` clamp) and expose it as `POST /auth/refresh` on `AuthController`, documented in
+    Swagger like any other operation. Switch `JWT_EXPIRES_IN` → `JWT_ACCESS_TTL=35m` + `JWT_SESSION_MAX_AGE=8h`,
+    add `AUTH_REFRESH_RATE_LIMIT`, and register all three in the boot-time env validation (fail fast if
+    `JWT_ACCESS_TTL` is below 10 min, which would leave no head-room for the client's 5 min margin).
+
 **frontend-developer (`front/`)**
 
 *Prerequisite: Node `^22.22.3 || ^24.15.0 || >=26.0.0` (A10) — `npm install` in `front/` fails on older runtimes.*
@@ -741,6 +954,14 @@ front/src/
 7. Unit tests per §9 (Vitest, not Karma/Jasmine). Until the backend is up, mock against §5 shapes — no contract
    improvisation.
 
+8. **Session keep-alive (§5.11):** add `core/session/session.service.ts` — one `setTimeout` scheduled at
+   `expiresIn - 300` s, a `visibilitychange`/`focus` check of the stored token's `exp`, and a single-flight
+   `POST /auth/refresh`. **No new dependency.** Wire it into `AuthService` (start after login and after
+   `restoreSession()`, stop and clear on logout), add `setToken()` as the single place that writes the token
+   signal + `sessionStorage`, and implement the client error rules of §5.11 (one refresh-and-replay on
+   `401 UNAUTHENTICATED`, immediate logout on `401 SESSION_EXPIRED`, back off on `429 RATE_LIMITED`). Rotation
+   must be invisible in the UI: no re-render, no navigation, no toast.
+
 **teamlead**
 1. Decompose §10 into tickets; backend items 1–4 and frontend items 1–3 are the critical path and can run
    fully in parallel against this contract.
@@ -753,13 +974,36 @@ front/src/
 4. Decide whether to schedule the optional hardening items (login rate limiting, httpOnly-cookie migration,
    OpenAPI-generated client) as post-MVP debt tickets — all are recorded in the ADRs.
 
+5. **Get product's answer on A12** (§2.5) before backend item 10 starts: is the session a hard 8 h cap, or a
+   sliding window that activity extends? The code differs by one line; the product behaviour differs a lot.
+   Also get the accepted consequence in §4 acknowledged in writing: a tab that sleeps past the 35 min mark lands
+   on the login page.
+
 **qa-engineer**
 1. Test plan against §5 (status codes and `code` values are assertable) and the seed dataset in §6.3.
 2. Flow: `POST /admin/initdb` → Swagger login as `user01` → authorize in Swagger → list → detail →
    repeat in the UI; plus negative cases (bad password, expired/absent token, unknown id, empty list).
 
+3. **Session keep-alive (§5.11)**, which needs a longer-running test pass than the rest of the MVP:
+   log in, keep the tab open and focused past the 30 min mark and assert the session survives with no visible
+   change and no re-login (run once with the real TTL, then with a shortened `JWT_ACCESS_TTL` for the rest);
+   assert exactly one `POST /auth/refresh` per interval in the network tab; leave the tab in the background past
+   the token's `exp` (or suspend the machine) and assert the documented behaviour — a clean redirect to `/login`,
+   with no refresh loop; bring a backgrounded tab back *before* `exp` and assert the `visibilitychange` refresh
+   fires; stop the backend across one refresh window and assert recovery on the next attempt; reach the 8 h
+   absolute deadline (use a small `JWT_SESSION_MAX_AGE`) and assert a clean redirect to `/login`; log out and
+   assert no further `/auth/refresh` calls appear.
+
 **Open items to confirm with product-manager**
-- Assumptions A1–A11 (§2.5), in particular A5 (shared seeded password) and A9 (`GET /auth/me` added).
+- Assumptions A1–A13 (§2.5), in particular A5 (shared seeded password), A9 (`GET /auth/me` added) and the
+  session assumptions A12 (what "every 30 minutes" means, and the hard 8 h cap) and A13 (per-tab sessions).
+- **The accepted failure mode of a client-driven refresh.** Rotation only happens while the tab is alive: a
+  sleeping laptop, or a tab frozen in the background for more than 35 min, ends on the login page (§4). If product
+  considers that unacceptable, the levers are a longer `JWT_ACCESS_TTL` (a wider stolen-token window) or the
+  server-push channel deferred in §3 — a decision to take before implementation, not after.
+- **A second real-time need, if one exists.** The PRD's endpoint list has none, so no push channel is designed.
+  If live configuration updates, notifications or presence are actually expected, say so now: it changes the §3
+  verdict on a server-push channel, and it is cheaper to add such a channel once than to add it twice.
 - A11 / PrimeNG licensing is a business decision, not an architectural one: someone has to confirm the team is
   eligible for the free Community license, or approve the Angular Material fallback.
 - That "organization" is intentionally invisible in the MVP UI (it is returned by the API but not displayed);
