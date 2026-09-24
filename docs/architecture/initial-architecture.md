@@ -86,6 +86,7 @@ no microservices — the MVP has one bounded context and a handful of endpoints.
 | UI kit | PrimeNG 22.1.x configured with `providePrimeNG` + a `@primeuix/themes` 3.x preset (Aura), `primeicons` 8, `@angular/cdk` 22 (PrimeNG peer). **Not MIT from v22** — licensing decision in §2.3 / A11 | ADR-005 |
 | Frontend tooling | `@angular/build` (esbuild) for build/serve; `ng test` → `@angular/build:unit-test` with the **Vitest** runner on jsdom; Node `^22.22.3 \|\| ^24.15.0 \|\| >=26.0.0` required | §2.3, A10 |
 | Dev cross-origin | Angular dev proxy `/api` → `http://localhost:3000`; backend CORS also configurable for non-proxied use | ADR-005 |
+| Logging | Nest's built-in logger to **stdout** only — no logging library, no log table in the database, and **no client-side logging or error reporting**: the frontend renders error states and ships nothing anywhere (§9) | — |
 | Package manager | **npm** for both projects (both already have `package-lock.json`) | — |
 
 ### 2.3 Verified version compatibility
@@ -263,6 +264,12 @@ These are architect assumptions, not product decisions. Flag to product-manager 
   a technical one, and the Angular Material fallback keeps it from becoming a lock-in (§2.3, §3, A11).
 - **No org filtering yet** means any logged-in user sees all configurations. This is a deliberate,
   PRD-sanctioned simplification (US-2) — it must not be read as an authorization model.
+- **Logging is the bare minimum, and that is known debt.** Plain-text lines from Nest's default logger to stdout:
+  no configurable level, no JSON output, no request log (method, path, status, duration), no correlation beyond
+  `sid`, and nothing at all from the browser. That is adequate while the only environments are a developer laptop
+  and docker-compose; the trigger to revisit it is the first shared environment with a log collector, and the cheap
+  steps then are, in order, a `LOG_LEVEL` env var, JSON output outside dev, and a small Nest interceptor for
+  request lines. A logging library (`pino`) buys nothing until something is actually collecting the output.
 - **Operational surface grows**: developers now need a running PostgreSQL (docker-compose) and a `.env`.
 
 **Non-functional assessment**
@@ -881,7 +888,18 @@ front/src/
 - **Swagger exposure:** `/api/docs` and `/api/docs-json` are registered only when `SWAGGER_ENABLED=true`; otherwise they do not exist (404), the same env-gated logic as `SEED_ENABLED`. Without it the full API surface is public in any non-local deployment.
 - **Serialization:** DTO-mapped responses only; never return TypeORM entities directly (prevents
   `passwordHash` leaks).
-- **Logging:** Nest's built-in logger; log auth failures at `warn` without the password; no request-body logging.
+- **Logging:** Nest's built-in logger, **stdout only** — no log file and no log table (the database holds domain
+  data; the session audit trail sketched in §6.4 is a different, out-of-scope feature). Log auth failures at `warn`
+  without the password; no request-body logging. The **global exception filter logs every unhandled exception at
+  `error` with its stack trace** and still returns only the generic §5.3 `INTERNAL_ERROR` envelope to the client —
+  the detail lives in the server log, never in the response. Session-related entries carry the `sid` claim for
+  correlation (§5.4): `sid` names a session but is not a credential, unlike the token itself, which is never logged
+  (§5.11). `429 RATE_LIMITED` is logged at `warn` — a healthy client calls `/auth/refresh` twice an hour, so hitting
+  the limit means a client loop or abuse; `401 SESSION_EXPIRED` is logged at `log`, because the 8 h deadline is the
+  designed outcome, not an anomaly.
+- **Frontend logging: none.** No error-reporting SDK and no `console.log` in committed code; failures surface as the
+  §8 error states, and the token is never written to the console. Shipping client errors somewhere (Sentry or a
+  `POST /client-logs` endpoint) is deliberately deferred, not overlooked — see the debt note in §4.
 - **Testing:**
   - back — unit tests for `AuthService` (hash compare, token payload) and `ConfigurationsService`;
     e2e (Supertest + a dedicated `config_viewer_test` PostgreSQL database from docker-compose) covering login 200/401, protected 401, list, detail 200/404,
